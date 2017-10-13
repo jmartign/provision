@@ -15,6 +15,7 @@ import (
 
 	"github.com/digitalrebar/provision/client/events"
 	"github.com/digitalrebar/provision/client/jobs"
+	"github.com/digitalrebar/provision/client/machines"
 	models "github.com/digitalrebar/provision/genmodels"
 	"github.com/go-openapi/strfmt"
 	"github.com/spf13/cobra"
@@ -64,6 +65,34 @@ func markMachineRunnable(uuid string, ops ModOps) error {
 		return err
 	}
 	return nil
+}
+
+func setMachineCurrentTask(uuid string, ct int, ops ModOps) error {
+	if _, err := Update(uuid, fmt.Sprintf("{\"CurrentTask\": %d}", ct), ops, false); err != nil {
+		fmt.Printf("Error setting machine as currentTask: %v\n", err)
+		return err
+	}
+	return nil
+}
+
+func setMachineStage(uuid, stage string, ops ModOps) error {
+	j := fmt.Sprintf("{\"Stage\": \"%s\"}", stage)
+	oldForce := force
+	force = true
+	if _, err := Update(uuid, j, ops, false); err != nil {
+		fmt.Printf("Error setting stage on machine, %s, as %s: %v, continuing\n", uuid, stage, err)
+		return err
+	}
+	force = oldForce
+	return nil
+}
+
+func setMachineWorkflow(uuid, workflow string) error {
+	return setMachineParam(uuid, "workflows/current", workflow)
+}
+
+func clearMachineWorkflow(uuid string) error {
+	return setMachineParam(uuid, "workflows/current", nil)
 }
 
 type CommandRunner struct {
@@ -232,6 +261,178 @@ func runContent(uuid *strfmt.UUID, action *models.JobAction) (failed, incomplete
 	return
 }
 
+func getMachineParams(uuid string) (map[string]interface{}, error) {
+	// Get all aggregate parameters.
+	as := "true"
+	d, err := session.Machines.GetMachineParams(machines.NewGetMachineParamsParams().WithAggregate(&as).WithUUID(strfmt.UUID(uuid)), basicAuth)
+	if err != nil {
+		return nil, generateError(err, "Failed to fetch params: %v", uuid)
+	}
+	return d.Payload, nil
+}
+
+func getWorkflowsCurrent(params map[string]interface{}) (string, bool) {
+	if wobj, ok := params["workflows/current"]; !ok {
+		return "", false
+	} else {
+		s, ok := wobj.(string)
+		return s, ok
+	}
+}
+func getWorkflowsVersion(params map[string]interface{}) (string, bool) {
+	if wobj, ok := params["workflows/version"]; !ok {
+		return "", false
+	} else {
+		s, ok := wobj.(string)
+		return s, ok
+	}
+}
+
+func getWorkflowsWorkflow(params map[string]interface{}, workflow string) (map[string]string, bool) {
+	if obj, ok := params["workflows/map"]; !ok {
+		return nil, false
+	} else {
+		cmap, ok := obj.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+
+		// Get map for current workflow
+		wfobj, ok := cmap[workflow]
+		if !ok {
+			return nil, false
+		}
+		s, ok := wfobj.(map[string]string)
+		return s, ok
+	}
+}
+
+func getChangeStageMap(params map[string]interface{}) (map[string]string, bool) {
+	if obj, ok := params["change-stage/map"]; !ok {
+		return map[string]string{}, false
+	} else {
+		s, ok := obj.(map[string]string)
+		return s, ok
+	}
+}
+
+func findCurrentWorkflow(params map[string]interface{}, stage string) (string, bool) {
+	if obj, ok := params["workflows/map"]; !ok {
+		return nil, false
+	} else {
+		cmap, ok := obj.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+
+		for _, wf := range cmap {
+			firstStage, err := getWorkflowsWorkflowFirstStage(params, wf)
+			if err != nil {
+				continue
+			}
+			if firstStage == stage {
+				return workflow, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func getWorkflowsWorkflowFirstStage(params map[string]interface{}, workflow string) (string, error) {
+	wfmap, err := getWorkflowsWorkflow(params, workflow)
+
+	// We now have a map of Sx -> Sy links.  We need to find the root of this tree.
+
+	// GREG: Fix this
+	root := "GREG"
+
+	return "", nil
+}
+
+func getNextStage(uuid, stage string, so *StageOps) (string, bool, error) {
+	params, err := getMachineParams(uuid)
+	if err != nil {
+		return "", false, err
+	}
+
+	// Find next stage
+	// - check for workflow/version
+	// - if no version, check for old stage map
+	// - else do version methods.
+	nextStage := ""
+	reboot := false
+
+	version, ok := getWorkflowsVersion(params)
+	if !ok {
+		cmap, ok := getChangeStageMap(params)
+		if !ok {
+			return "", false, nil
+		} else {
+			if ns, ok := cmap[stage]; ok {
+				pieces := strings.Split(ns, ":")
+				nextStage = pieces[0]
+				if len(pieces) > 1 && pieces[1] == "Reboot" {
+					reboot = true
+				}
+			} else {
+				nextStage = ""
+			}
+		}
+	} else {
+		if version != "1.0" {
+			return "", false, generateError(err, "Unknown workflow version %s: %s", version, uuid)
+		}
+
+		// Get current workflow
+		workflow, ok := getWorkflowsCurrent(params)
+		if !ok {
+			// Current workflow is not set.  Don't play the game
+			return "", false, nil
+		}
+
+		// get Workflow's map
+		wfmap, ok := getWorkflowsWorkflow(params, workflow)
+		if !ok {
+			return "", false, fmt.Errorf("workflows/map subsection, %s, not in correct format", workflow)
+		}
+
+		// Get nextStage from current workflow map
+		nextStage, ok := wfmap[stage]
+		if !ok {
+			return "", false, clearMachineWorkflow(uuid)
+		}
+
+		// Get Reboot flag from next Stage
+		if sobj, err := Get(nextStage, so); err == nil {
+			stage := sobj.(*models.Stage)
+			reboot = stage.Reboot
+		} else {
+			return "", false, fmt.Errorf("Stage, %s, not found", nextStage)
+		}
+	}
+
+	return nextStage, reboot, nil
+}
+
+func nextPxeBootMachine(uuid string) error {
+	d, err := session.Machines.GetMachineActions(machines.NewGetMachineActionsParams().WithUUID(strfmt.UUID(uuid)), basicAuth)
+	if err != nil {
+		return generateError(err, "Failed to fetch actions: %v", uuid)
+	}
+	actions := d.Payload
+
+	for _, aa := range actions {
+		if aa.Command == "nextbootpxe" {
+			actionParams := map[string]interface{}{}
+			if _, err := session.Machines.PostMachineAction(machines.NewPostMachineActionParams().WithBody(actionParams).WithUUID(strfmt.UUID(uuid)).WithName("nextbootpxe"), basicAuth); err != nil {
+				return generateError(err, "Error running action: nextbootpxe")
+			}
+			break
+		}
+	}
+	return nil
+}
+
 func processJobsCommand() *cobra.Command {
 	mo := &MachineOps{CommonOps{Name: "machines", SingularName: "machine"}}
 	jo := &JobOps{CommonOps{Name: "jobs", SingularName: "job"}}
@@ -275,8 +476,46 @@ the stage runner wait flag.
 				}
 			}
 
-			// Mark Machine runnnable
-			markMachineRunnable(machine.UUID.String(), mo)
+			// Reset Machine information.
+			params, err := getMachineParams(uuid)
+			if err != nil {
+				return generateError(err, "Error getting machine params")
+			}
+
+			// Should we use workflows
+			version, ok := getWorkflowsVersion(params)
+			if ok && version == "1.0" {
+				// Get current workflow
+				workflow, ok := getWorkflowsCurrent(params)
+
+				// Current workflow isn't set, need to set it
+				if !ok {
+					workflow, ok = findCurrentWorkflow(params, machine.Stage)
+					if ok {
+						if err := setMachineWorkflow(uuid, workflow); err != nil {
+							return generateError(err, "Failed to set machine's workflow")
+						}
+					}
+				}
+
+				// if workflow is valid, set the stage to the beginning stage for workflow
+				if ok {
+					newStage, err := getWorkflowsWorkflowFirstStage(params, workflow)
+					if err == nil && newStage != machine.Stage {
+						if err := setMachineStage(uuid, newStage, mo); err != nil {
+							return generateError(err, "Error setting next stage")
+						}
+					} else if err != nil {
+						return generateError(err, "Error finding containing workflow")
+					}
+				}
+			}
+
+			// reset the task index
+			setMachineCurrentTask(uuid, -1, mo)
+
+			// Mark machine as runnable
+			markMachineRunnable(uuid, mo)
 
 			did_job := false
 			for {
@@ -293,26 +532,39 @@ the stage runner wait flag.
 					break
 				}
 
-				// Create a job for tasks
+				// Create a job for tasks - API Call to get next job on machine
 				var job *models.Job
 				if obj, err := jo.Create(&models.Job{Machine: machine.UUID}); err != nil {
 					fmt.Printf("Error creating a job for machine: %v, continuing\n", err)
 					time.Sleep(5 * time.Second)
 					continue
 				} else {
+					// No object, means we don't have work to do.
 					if obj == nil {
 						if did_job {
 							fmt.Println("Jobs finished")
 							did_job = false
 						}
 
+						// Get the machine's stage. It will tell us what is next.
+						// 1. check to see if we should wait for more tasks
+						// 2. if no more tasks and no waiting, do a stage change.
 						wait := false
+						reboot := false
+						nextStage := ""
 						if obj, err := Get(uuid, mo); err == nil {
 							machine = obj.(*models.Machine)
 
 							if sobj, err := Get(machine.Stage, so); err == nil {
 								stage := sobj.(*models.Stage)
 								wait = stage.RunnerWait
+
+								// We aren't waiting, check to see if we have a new stage
+								if !wait {
+									if nextStage, reboot, err = getNextStage(uuid, machine.Stage, so); err != nil {
+										return generateError(err, "Error getting next stage")
+									}
+								}
 							}
 						}
 
@@ -322,6 +574,27 @@ the stage runner wait flag.
 							time.Sleep(5 * time.Second)
 							continue
 						} else {
+							if nextStage != "" {
+								// Set stage on machine
+								if err := setMachineStage(uuid, nextStage, mo); err != nil {
+									return generateError(err, "Error setting next stage")
+								}
+
+								// Reboot to next bootenv
+								if reboot {
+									if err := nextPxeBootMachine(uuid); err != nil {
+										return generateError(err, "Error setting next pxe boot")
+									}
+
+									_, err := exec.Command("reboot").Output()
+									if err != nil {
+										return generateError(err, "Error rebooting node")
+									}
+								} else {
+									// We didn't reboot, go get tasks
+									continue
+								}
+							}
 							break
 						}
 					}
@@ -342,10 +615,7 @@ the stage runner wait flag.
 				}
 
 				// Mark job as running
-				if _, err := Update(job.UUID.String(), `{"State": "running"}`, jo, false); err != nil {
-					s := fmt.Sprintf("Error marking job as running: %v, continue\n", err)
-					fmt.Printf(s)
-					Log(job.UUID, s)
+				if err := markJob(job.UUID.String(), "running", jo); err != nil {
 					markJob(job.UUID.String(), "failed", jo)
 					continue
 				}

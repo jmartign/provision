@@ -258,6 +258,21 @@ func init() {
 	App.AddCommand(tree)
 }
 
+func setMachineParam(uuid, key string, value interface{}) error {
+	d, err := session.Machines.GetMachineParams(machines.NewGetMachineParamsParams().WithUUID(strfmt.UUID(uuid)), basicAuth)
+	if err != nil {
+		return generateError(err, "Failed to fetch params %v: %v", "machines", uuid)
+	}
+	pp := d.Payload
+	if value == nil {
+		delete(pp, key)
+	} else {
+		pp[key] = value
+	}
+	_, err = session.Machines.PostMachineParams(machines.NewPostMachineParamsParams().WithUUID(strfmt.UUID(uuid)).WithBody(pp), basicAuth)
+	return err
+}
+
 func testMachine(field, value string, fields map[string]interface{}) (bool, error) {
 	var err error
 	matched := false
@@ -507,19 +522,8 @@ Returns the following strings:
 				return fmt.Errorf("Unable to unmarshal input stream: %v\n", err)
 			}
 
-			d, err := session.Machines.GetMachineParams(machines.NewGetMachineParamsParams().WithUUID(strfmt.UUID(uuid)), basicAuth)
-			if err != nil {
-				return generateError(err, "Failed to fetch params %v: %v", singularName, uuid)
-			}
-			pp := d.Payload
-			if value == nil {
-				delete(pp, key)
-			} else {
-				pp[key] = value
-			}
-			_, err = session.Machines.PostMachineParams(machines.NewPostMachineParamsParams().WithUUID(strfmt.UUID(uuid)).WithBody(pp), basicAuth)
-			if err != nil {
-				return generateError(err, "Failed to post params %v: %v", singularName, uuid)
+			if err := setMachineParam(uuid, key, value); err != nil {
+				return err
 			}
 			return prettyPrint(value)
 		},

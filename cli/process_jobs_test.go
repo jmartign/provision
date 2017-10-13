@@ -231,6 +231,8 @@ var processJobsShowRunnableMachineString = `RE:
 
 var processJobsOutputSecondPassSuccessString = `RE:
 Processing jobs for 3e7031fe-3062-45f1-835c-92541bc9cbd3
+Starting Task: jamie \([\S\s]*\)
+Task: jamie finished
 Starting Task: justine \([\S\s]*\)
 Putting Content in place for Task Template: part 1 - copy file
 Task Template: part 1 - copy file - Copied contents to test.txt successfully
